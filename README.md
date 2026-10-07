@@ -13,6 +13,11 @@ A perception pipeline for the **nuScenes** self-driving dataset. It fuses
 *scene-0061 replayed at 2× speed. The camera follows the vehicle through a left turn;
 the 6 camera images are shown top right.*
 
+![Close follow view of scene-0061: EKF track boxes, radar returns and live scans around the vehicle](docs/media/nuscenes_scene_0061_follow.gif)
+
+*The same drive from a closer camera that follows the vehicle, so the track boxes,
+radar returns and live scans are easier to see.*
+
 > **SLAM or not?** The vehicle's position comes from nuScenes' own localization.
 > KISS-ICP LiDAR odometry runs alongside and is **scored** against it, but the map
 > and tracking use the dataset's positions. So this project is sensor fusion,
