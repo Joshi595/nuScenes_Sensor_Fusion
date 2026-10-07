@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>nuScenes Fusion Viewer</title>
+  <style>
+    html, body { height: 100%; margin: 0; overflow: hidden; background: #0f141b; color: #e6edf3;
+      font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+    canvas { display: block; }
+    .panel { position: absolute; z-index: 2; background: rgba(15, 20, 27, 0.82);
+      border: 1px solid #2b3540; border-radius: 6px; padding: 8px 12px; }
+    #heading { top: 12px; left: 12px; pointer-events: none; }
+    #heading h1 { margin: 0; font-size: 15px; font-weight: 600; }
+    #heading p { margin: 2px 0 0; color: #9aa7b4; }
+    #status { bottom: 12px; left: 12px; color: #9aa7b4; pointer-events: none; }
+    #replay { bottom: 12px; right: 12px; display: none; align-items: center; gap: 8px; }
+    #replay input[type=range] { width: min(320px, 40vw); }
+    button, select { background: #1f2a36; color: inherit; border: 1px solid #3a4756;
+      border-radius: 4px; padding: 3px 8px; font: inherit; cursor: pointer; }
+    #help { top: 12px; right: 12px; color: #9aa7b4; pointer-events: none; }
+    #cameraPanel { top: 56px; right: 12px; padding: 4px; display: none; pointer-events: none; }
+    #cameraPanel canvas { display: block; width: min(560px, 42vw); height: auto; border-radius: 3px; }
+    #cameraPanel span { display: block; padding: 3px 4px 0; color: #9aa7b4; font-size: 12px; }
+    @media (max-width: 640px) { #help { display: none; } #cameraPanel { top: 12px; }
+      #replay { left: 12px; flex-wrap: wrap; } }
+  </style>
+</head>
+<body>
+  <div id="heading" class="panel"><h1 id="title">Loadingâ€¦</h1><p id="summary"></p></div>
+  <div id="help" class="panel">Drag: orbit Â· Right-drag: pan Â· Wheel: zoom Â· Zoom in to stream full detail</div>
+  <div id="status" class="panel">Loading manifestâ€¦</div>
+  <div id="cameraPanel" class="panel"><canvas id="cameraCanvas" aria-label="Camera frames for the current scan"></canvas><span id="cameraCaption">cameras Â· LiDAR returns in view take these colors</span></div>
+  <div id="replay" class="panel">
+    <button id="play" title="Play / pause (space)">â–¶</button>
+    <button id="reset" title="Back to the first scan">â®</button>
+    <input id="scrub" type="range" min="0" value="0">
+    <span id="frameLabel"></span>
+    <select id="speed" title="Playback speed">
+      <option value="0.5">0.5Ã—</option><option value="1" selected>1Ã—</option>
+      <option value="2">2Ã—</option><option value="5">5Ã—</option><option value="10">10Ã—</option>
+    </select>
+    <select id="trail" title="How many recent scans stay visible behind the vehicle">
+      <option value="1">live scan</option><option value="10">trail 10</option>
+      <option value="50" selected>trail 50</option><option value="200">trail 200</option>
+    </select>
+    <label><input id="showScan" type="checkbox" checked> scans</label>
+    <label><input id="showMap" type="checkbox" checked> map</label>
+    <label id="showCameraLabel" style="display:none"><input id="showCamera" type="checkbox" checked> cameras</label>
+    <label><input id="follow" type="checkbox"> follow</label>
+    <span id="overlayToggles" style="display:none">
+      <label title="EKF tracks: orange = moving (arrow = 1 s of motion), blue = static"><input id="showTracks" type="checkbox" checked> tracks</label>
+      <label title="Annotated vehicles (ground truth, white)"><input id="showLabels" type="checkbox"> labels</label>
+      <label title="Radar returns: red = moving (Doppler), grey = static"><input id="showRadar" type="checkbox" checked> radar</label>
+    </span>
+  </div>
+
+  <script src="vendor/three.min.js"></script>
+  <script src="vendor/OrbitControls.js"></script>
+  <script>
+  "use strict";
+  // Same height palette as sensor_fusion/visualization.py.
+  const DETAIL_POINT_BUDGET = 4_000_000;
+  const FULL_LOAD_POINTS = 3_000_000;   // maps up to this size are loaded entirely at start
+  const PALETTE = [[29, 78, 137], [38, 166, 154], [117, 201, 80], [253, 210, 45], [224, 72, 50]];
+  const statusEl = document.getElementById("status");
+
+  function paletteColor(t, out, offset) {
+    const scaled = Math.max(0, Math.min(1, t)) * (PALETTE.length - 1);
+    const lower = Math.floor(scaled), upper = Math.min(lower + 1, PALETTE.length - 1), f = scaled - lower;
+    for (let c = 0; c < 3; c++) out[offset + c] = PALETTE[lower][c] * (1 - f) + PALETTE[upper][c] * f;
+  }
+
+  async function main() {
+    const manifest = await (await fetch("manifest.json")).json();
+    document.title = manifest.title;
+    document.getElementById("title").textContent = manifest.title;
+    const trajectory = manifest.trajectory;
+    let distance = 0;
+    for (let i = 1; i < trajectory.length; i++) {
+      distance += Math.hypot(...[0, 1, 2].map((a) => trajectory[i][a] - trajectory[i - 1][a]));
+    }
+    document.getElementById("summary").textContent =
+      `${manifest.pointCount.toLocaleString()} points Â· ${trajectory.length.toLocaleString()} poses Â· ` +
+      `${(distance / 1000).toFixed(2)} km`;
+
+    // Render relative to the map center so float32 GPU positions keep millimetre precision.
+    const bmin = manifest.bounds.min, bmax = manifest.bounds.max;
+    const origin = bmin.map((v, a) => (v + bmax[a]) / 2);
+    const span = Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1], 10);
+    const [heightLow, heightHigh] = manifest.heightRange;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    document.body.appendChild(renderer.domElement);
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0f141b);
+    const camera = new THREE.PerspectiveCamera(50, window.innerWidth / window.innerHeight, 0.1, span * 10);
+    camera.up.set(0, 0, 1);
+    camera.position.set(span * 0.6, -span * 0.6, span * 0.5);
+    const controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.screenSpacePanning = true;
+    controls.maxDistance = span * 4;
+    controls.update();
+
+    // Decode one .bin block: uint16 XYZ quantized to entry.min/max, then uint8 RGB (if any).
+    function decode(buffer, entry, hasColor) {
+      const n = entry.count;
+      const q = new Uint16Array(buffer, 0, n * 3);
+      const positions = new Float32Array(n * 3);
+      const colors = new Uint8Array(n * 3);
+      const scale = [0, 1, 2].map((a) => (entry.max[a] - entry.min[a]) / 65535);
+      const shift = [0, 1, 2].map((a) => entry.min[a] - origin[a]);
+      const rgb = hasColor ? new Uint8Array(buffer, n * 6, n * 3) : null;
+      for (let i = 0; i < n * 3; i += 3) {
+        for (let a = 0; a < 3; a++) positions[i + a] = shift[a] + q[i + a] * scale[a];
+        if (rgb) { colors[i] = rgb[i]; colors[i + 1] = rgb[i + 1]; colors[i + 2] = rgb[i + 2]; }
+        else paletteColor((positions[i + 2] + origin[2] - heightLow) / (heightHigh - heightLow), colors, i);
+      }
+      return { positions, colors };
+    }
+    function makePoints(decoded, size, opacity) {
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(decoded.positions, 3));
+      geometry.setAttribute("color", new THREE.Uint8BufferAttribute(decoded.colors, 3, true));
+      geometry.computeBoundingSphere();
+      return new THREE.Points(geometry, new THREE.PointsMaterial({
+        size, sizeAttenuation: true, vertexColors: true,
+        transparent: opacity < 1, opacity, depthWrite: opacity === 1,
+      }));
+    }
+    async function loadBlock(entry, size, opacity) {
+      const buffer = await (await fetch(entry.file)).arrayBuffer();
+      return makePoints(decode(buffer, entry, manifest.hasColor), size, opacity);
+    }
+
+    // Whole-map overview plus route and start/end markers.
+    const mapLayer = new THREE.Group();
+    scene.add(mapLayer);
+    const overviewCloud = await loadBlock(manifest.overview, manifest.pointSize * 3, 1);
+    mapLayer.add(overviewCloud);
+    const route = new Float32Array(trajectory.length * 3);
+    trajectory.forEach((p, i) => { for (let a = 0; a < 3; a++) route[i * 3 + a] = p[a] - origin[a]; });
+    const routeGeometry = new THREE.BufferGeometry();
+    routeGeometry.setAttribute("position", new THREE.BufferAttribute(route, 3));
+    scene.add(new THREE.Line(routeGeometry, new THREE.LineBasicMaterial({ color: 0xff5964 })));
+    const markerRadius = Math.max(span * 0.004, 1);
+    function marker(position, color) {
+      const mesh = new THREE.Mesh(new THREE.SphereGeometry(markerRadius, 16, 12), new THREE.MeshBasicMaterial({ color }));
+      mesh.position.set(...position.map((v, a) => v - origin[a]));
+      scene.add(mesh);
+      return mesh;
+    }
+    marker(trajectory[0], 0x1b998b);
+    marker(trajectory[trajectory.length - 1], 0xd1495b);
+
+    // Stream full-density tiles near the orbit target, nearest first, within a point budget.
+    const loaded = new Map();   // tile index -> THREE.Points or "loading"
+    let detailCount = 0;
+    function distanceToTile(tile, x, y) {
+      const dx = Math.max(tile.min[0] - origin[0] - x, 0, x - (tile.max[0] - origin[0]));
+      const dy = Math.max(tile.min[1] - origin[1] - y, 0, y - (tile.max[1] - origin[1]));
+      return Math.hypot(dx, dy);
+    }
+    function updateTiles() {
+      const viewDistance = camera.position.distanceTo(controls.target);
+      // Small maps fit entirely in the overview; larger ones stream tiles once zoomed in.
+      const streaming = manifest.overview.count < manifest.pointCount && viewDistance < span * 0.5;
+      const radius = Math.min(Math.max(viewDistance * 0.8, 40), 400);
+      const wanted = new Set();
+      let budget = 0;
+      manifest.tiles
+        .map((tile, index) => [distanceToTile(tile, controls.target.x, controls.target.y), index])
+        .filter(([d]) => streaming && d <= radius)
+        .sort((a, b) => a[0] - b[0])
+        .forEach(([, index]) => {
+          const count = manifest.tiles[index].count;
+          if (budget + count <= DETAIL_POINT_BUDGET || wanted.size === 0) { wanted.add(index); budget += count; }
+        });
+      for (const [index, cloud] of loaded) {
+        if (wanted.has(index) || cloud === "loading") continue;
+        mapLayer.remove(cloud); cloud.geometry.dispose(); cloud.material.dispose();
+        loaded.delete(index);
+      }
+      for (const index of wanted) {
+        if (loaded.has(index)) continue;
+        loaded.set(index, "loading");
+        loadBlock(manifest.tiles[index], manifest.pointSize, 1).then((cloud) => {
+          if (loaded.get(index) !== "loading") return;
+          loaded.set(index, cloud);
+          mapLayer.add(cloud);
+          updateTiles();
+        });
+      }
+      detailCount = [...loaded.entries()]
+        .filter(([, c]) => c !== "loading").reduce((sum, [i]) => sum + manifest.tiles[i].count, 0);
+      const pending = [...loaded.values()].filter((c) => c === "loading").length;
+      statusEl.textContent = `Overview ${manifest.overview.count.toLocaleString()} Â· ` +
+        `Detail ${detailCount.toLocaleString()} of ${manifest.pointCount.toLocaleString()}` +
+        (pending ? ` Â· loading ${pending} tile${pending > 1 ? "s" : ""}` : "");
+    }
+    if (manifest.pointCount <= FULL_LOAD_POINTS) {
+      // Whole map at full density (about 9 bytes per point); the overview stays until it is in.
+      let done = 0;
+      statusEl.textContent = `Loading full map: 0 / ${manifest.tiles.length} tiles`;
+      Promise.all(manifest.tiles.map((tile) => loadBlock(tile, manifest.pointSize, 1).then((cloud) => {
+        mapLayer.add(cloud);
+        statusEl.textContent = `Loading full map: ${++done} / ${manifest.tiles.length} tiles`;
+      }))).then(() => {
+        mapLayer.remove(overviewCloud);
+        document.getElementById("help").textContent = "Drag: orbit Â· Right-drag: pan Â· Wheel: zoom Â· Space: play";
+        statusEl.textContent = `Full map Â· ${manifest.pointCount.toLocaleString()} points`;
+      });
+    } else {
+      let tileTimer = null;
+      controls.addEventListener("change", () => { clearTimeout(tileTimer); tileTimer = setTimeout(updateTiles, 150); });
+      updateTiles();
+    }
+
+    // Replay of recorded scans at their estimated poses. Camera-colored replays fuse each
+    // scan with its image; the trail keeps recent scans so the fused cloud builds up.
+    const replay = manifest.replay;
+    let step = () => {};
+    if (replay) {
+      const buffer = await (await fetch(replay.file)).arrayBuffer();
+      const total = replay.counts.reduce((a, b) => a + b, 0);
+      const q = new Uint16Array(buffer, 0, total * 3);
+      const attributes = new Uint8Array(buffer, total * 6, replay.hasColor ? total * 3 : total);
+      const offsets = [0];
+      replay.counts.forEach((c) => offsets.push(offsets[offsets.length - 1] + c));
+      const slotSize = Math.max(1, ...replay.counts);
+      const maxTrail = 200;
+      const scale = [0, 1, 2].map((a) => (replay.max[a] - replay.min[a]) / 65535);
+
+      // Ring buffer of world-space scans; unused slots hold NaN so the GPU drops them.
+      const positions = new Float32Array(slotSize * maxTrail * 3).fill(NaN);
+      const colors = new Uint8Array(slotSize * maxTrail * 3);
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      // Plain BufferAttribute keeps a reference; Uint8BufferAttribute would copy and never see updates.
+      geometry.setAttribute("color", new THREE.BufferAttribute(colors, 3, true));
+      const scans = new THREE.Points(geometry, new THREE.PointsMaterial({
+        size: Math.max(manifest.pointSize * 1.5, 0.12), sizeAttenuation: true, vertexColors: true,
+      }));
+      scans.frustumCulled = false;
+      scene.add(scans);
+      const vehicle = marker(trajectory[0], 0xffffff);
+
+      const ui = Object.fromEntries(
+        ["play", "reset", "scrub", "frameLabel", "speed", "trail", "showScan", "showMap", "follow", "showCamera"]
+          .map((id) => [id, document.getElementById(id)]));
+      document.getElementById("replay").style.display = "flex";
+      const cameraPanel = document.getElementById("cameraPanel");
+      const cameraCanvas = document.getElementById("cameraCanvas");
+      const cameraCaption = document.getElementById("cameraCaption");
+      const cameraImages = [];
+      let cameraShown = -1;
+      function cameraImage(index) {
+        if (!cameraImages[index]) {
+          const image = new Image();
+          image.src = replay.cameraFiles[index];
+          cameraImages[index] = image;
+        }
+        return cameraImages[index];
+      }
+      function drawCamera(index) {
+        // Show this frame if it is decoded, else the nearest earlier decoded one, and redraw on arrival.
+        const image = cameraImage(index);
+        let ready = index;
+        while (ready >= 0 && !(cameraImages[ready] && cameraImages[ready].complete && cameraImages[ready].naturalWidth)) ready--;
+        if (ready >= 0 && ready !== cameraShown) {
+          const source = cameraImages[ready];
+          if (cameraCanvas.width !== source.naturalWidth) {
+            cameraCanvas.width = source.naturalWidth;
+            cameraCanvas.height = source.naturalHeight;
+          }
+          cameraCanvas.getContext("2d").drawImage(source, 0, 0);
+          cameraShown = ready;
+        }
+        cameraCaption.textContent = ready === index
+          ? "cameras Â· LiDAR returns in view take these colors"
+          : "cameras Â· loading frameâ€¦";
+        if (ready !== index) image.onload = () => { if (current === index) drawCamera(index); };
+      }
+      if (replay.cameraFiles) {
+        cameraPanel.style.display = "block";
+        document.getElementById("showCameraLabel").style.display = "inline";
+        ui.showCamera.onchange = () => { cameraPanel.style.display = ui.showCamera.checked ? "block" : "none"; };
+        (async () => {   // preload every frame in order, a few at a time
+          for (let start = 0; start < replay.cameraFiles.length; start += 6) {
+            const batch = [];
+            for (let i = start; i < Math.min(start + 6, replay.cameraFiles.length); i++) {
+              batch.push(cameraImage(i).decode().catch(() => {}));
+            }
+            await Promise.all(batch);
+          }
+        })();
+      }
+      if (!replay.hasColor) ui.trail.value = "1";
+      ui.scrub.max = replay.frames.length - 1;
+      let current = -1, playing = false, clock = 0;
+
+      function writeSlot(slot, index) {
+        const p = replay.poses[index];
+        const start = offsets[index], count = replay.counts[index], base = slot * slotSize * 3;
+        for (let i = 0; i < count; i++) {
+          const source = (start + i) * 3, target = base + i * 3;
+          const x = replay.min[0] + q[source] * scale[0];
+          const y = replay.min[1] + q[source + 1] * scale[1];
+          const z = replay.min[2] + q[source + 2] * scale[2];
+          positions[target] = p[0] * x + p[1] * y + p[2] * z + p[3] - origin[0];
+          positions[target + 1] = p[4] * x + p[5] * y + p[6] * z + p[7] - origin[1];
+          positions[target + 2] = p[8] * x + p[9] * y + p[10] * z + p[11] - origin[2];
+          if (replay.hasColor) {
+            colors[target] = attributes[source];
+            colors[target + 1] = attributes[source + 1];
+            colors[target + 2] = attributes[source + 2];
+          } else {
+            paletteColor(attributes[start + i] / 255, colors, target);
+          }
+        }
+        positions.fill(NaN, base + count * 3, base + slotSize * 3);
+      }
+
+      function show(index) {
+        const trail = Number(ui.trail.value);
+        const sequential = index > current && index - current < trail;
+        if (!sequential) positions.fill(NaN);
+        for (let k = sequential ? current + 1 : Math.max(0, index - trail + 1); k <= index; k++) {
+          writeSlot(k % trail, k);
+        }
+        geometry.setDrawRange(0, trail * slotSize);
+        geometry.attributes.position.needsUpdate = true;
+        geometry.attributes.color.needsUpdate = true;
+        current = index;
+
+        const p = replay.poses[index];
+        const previous = vehicle.position.clone();
+        vehicle.position.set(p[3] - origin[0], p[7] - origin[1], p[11] - origin[2]);
+        if (ui.follow.checked) {
+          const delta = vehicle.position.clone().sub(previous);
+          camera.position.add(delta);
+          controls.target.add(delta);
+        }
+        if (replay.cameraFiles) drawCamera(index);
+        drawOverlays(index);
+        ui.scrub.value = index;
+        ui.frameLabel.textContent = `scan ${replay.frames[index]}`;
+      }
+      // Tracked objects, labels, and radar for the current frame (nuScenes pipeline).
+      const overlay = new THREE.Group();
+      scene.add(overlay);
+      let drawOverlays = () => {};
+      if (replay.tracks || replay.labels || replay.radarCounts) {
+        document.getElementById("overlayToggles").style.display = "inline";
+        const toggles = Object.fromEntries(["showTracks", "showLabels", "showRadar"]
+          .map((id) => [id, document.getElementById(id)]));
+        const radarOffsets = [0];
+        let radarValues = null;
+        if (replay.radarCounts) {
+          replay.radarCounts.forEach((c) => radarOffsets.push(radarOffsets[radarOffsets.length - 1] + c));
+          radarValues = new Float32Array(await (await fetch("radar.bin")).arrayBuffer());
+        }
+        const MOVING = [1.0, 0.55, 0.1], STATIC = [0.25, 0.65, 0.84], LABEL = [0.92, 0.92, 0.92];
+
+        function addBox(segments, colors, box, color, arrow) {
+          // box: [x, y, z, yaw, length, width, height]
+          const [x, y, z, yaw, l, w, h] = box;
+          const c = Math.cos(yaw), s = Math.sin(yaw);
+          const corner = (a, b, up) => [
+            x + c * a * l / 2 - s * b * w / 2 - origin[0],
+            y + s * a * l / 2 + c * b * w / 2 - origin[1],
+            z + up * h / 2 - origin[2],
+          ];
+          const ring = (up) => [corner(1, 1, up), corner(-1, 1, up), corner(-1, -1, up), corner(1, -1, up)];
+          const bottom = ring(-1), top = ring(1);
+          const edges = [];
+          for (let i = 0; i < 4; i++) {
+            edges.push(bottom[i], bottom[(i + 1) % 4], top[i], top[(i + 1) % 4], bottom[i], top[i]);
+          }
+          if (arrow) edges.push([x - origin[0], y - origin[1], z - origin[2]],
+                                [x + arrow[0] - origin[0], y + arrow[1] - origin[1], z - origin[2]]);
+          for (const point of edges) { segments.push(...point); colors.push(...color); }
+        }
+        function lines(segments, colors) {
+          const geometry = new THREE.BufferGeometry();
+          geometry.setAttribute("position", new THREE.Float32BufferAttribute(segments, 3));
+          geometry.setAttribute("color", new THREE.Float32BufferAttribute(colors, 3));
+          return new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ vertexColors: true }));
+        }
+        drawOverlays = (index) => {
+          for (const child of [...overlay.children]) {
+            overlay.remove(child); child.geometry.dispose(); child.material.dispose();
+          }
+          const segments = [], colors = [];
+          if (toggles.showTracks.checked && replay.tracks) {
+            // [id, x, y, z, yaw, length, width, height, vx, vy, moving]
+            for (const t of replay.tracks[index]) {
+              addBox(segments, colors, t.slice(1, 8), t[10] ? MOVING : STATIC, t[10] ? [t[8], t[9]] : null);
+            }
+          }
+          if (toggles.showLabels.checked && replay.labels) {
+            for (const box of replay.labels[index]) addBox(segments, colors, box, LABEL, null);
+          }
+          if (segments.length) overlay.add(lines(segments, colors));
+          if (toggles.showRadar.checked && radarValues) {
+            const start = radarOffsets[index], count = replay.radarCounts[index];
+            const positions = new Float32Array(count * 3), radarColors = new Float32Array(count * 3);
+            for (let i = 0; i < count; i++) {
+              const v = radarValues.subarray((start + i) * 5, (start + i) * 5 + 5);
+              positions.set([v[0] - origin[0], v[1] - origin[1], v[2] - origin[2]], i * 3);
+              radarColors.set(Math.hypot(v[3], v[4]) > 1 ? [1, 0.2, 0.35] : [0.6, 0.6, 0.65], i * 3);
+            }
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute("color", new THREE.BufferAttribute(radarColors, 3));
+            overlay.add(new THREE.Points(geometry, new THREE.PointsMaterial({ size: 0.6, vertexColors: true })));
+          }
+        };
+        for (const toggle of Object.values(toggles)) toggle.onchange = () => drawOverlays(current);
+      }
+
+      function setPlaying(value) { playing = value; ui.play.textContent = playing ? "â¸" : "â–¶"; }
+      ui.play.onclick = () => setPlaying(!playing);
+      ui.reset.onclick = () => { setPlaying(false); current = -1; show(0); };
+      ui.scrub.oninput = () => show(Number(ui.scrub.value));
+      ui.trail.onchange = () => { const index = current; current = -1; show(index); };
+      ui.showScan.onchange = () => { scans.visible = ui.showScan.checked; };
+      ui.showMap.onchange = () => { mapLayer.visible = ui.showMap.checked; };
+      ui.follow.onchange = () => {
+        if (!ui.follow.checked) return;
+        const d = vehicle.position.clone().sub(controls.target);
+        controls.target.add(d);
+        camera.position.add(d);
+      };
+      window.addEventListener("keydown", (e) => { if (e.code === "Space") { e.preventDefault(); setPlaying(!playing); } });
+      const frameStride = replay.frames.length > 1 ? Math.max(1, replay.frames[1] - replay.frames[0]) : 1;
+      step = (seconds) => {
+        if (!playing) return;
+        clock += seconds * (replay.rateHz || 10) * Number(ui.speed.value) / frameStride;
+        const advance = Math.floor(clock);
+        if (advance < 1) return;
+        clock -= advance;
+        if (current + advance >= replay.frames.length) { setPlaying(false); show(replay.frames.length - 1); }
+        else show(current + advance);
+      };
+      show(0);
+    }
+
+    window.addEventListener("resize", () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+    let last = performance.now();
+    renderer.setAnimationLoop((now) => {
+      step(Math.min((now - last) / 1000, 0.25));
+      last = now;
+      controls.update();
+      renderer.render(scene, camera);
+    });
+  }
+
+  main().catch((error) => {
+    statusEl.textContent = location.protocol === "file:"
+      ? "Browsers block loading map tiles from file://. Serve this folder: python -m http.server -d <this folder>"
+      : `Failed to load the map: ${error.message}`;
+    console.error(error);
+  });
+  </script>
+</body>
+</html>
